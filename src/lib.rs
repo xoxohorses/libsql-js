@@ -1445,7 +1445,7 @@ pub struct RowsIterator {
     safe_ints: bool,
     raw: bool,
     pluck: bool,
-    timeout_guard: Mutex<Option<QueryTimeoutGuard>>,
+    timeout_guard: Arc<Mutex<Option<QueryTimeoutGuard>>>,
 }
 
 #[napi]
@@ -1466,7 +1466,7 @@ impl RowsIterator {
             safe_ints,
             raw,
             pluck,
-            timeout_guard: Mutex::new(timeout_guard),
+            timeout_guard: Arc::new(Mutex::new(timeout_guard)),
         }
     }
 
@@ -1492,16 +1492,85 @@ impl RowsIterator {
         })
     }
 
+    #[napi(ts_return_type = "Promise<{ records: unknown[]; done: boolean }>")]
+    pub fn next_batch(&self, env: Env, max_rows: u32) -> Result<napi::JsObject> {
+        if max_rows == 0 {
+            return Err(napi::Error::from_reason(
+                "maxRows must be greater than zero",
+            ));
+        }
+
+        let rows = self.rows.clone();
+        let stmt = self.stmt.clone();
+        let timeout_guard = self.timeout_guard.clone();
+        let column_count = self.column_names.len();
+        let future = async move {
+            let mut rows = rows.lock().await;
+            let mut records = Vec::with_capacity(max_rows as usize);
+            let mut done = false;
+
+            for _ in 0..max_rows {
+                let row = match rows.next().await {
+                    Ok(row) => row,
+                    Err(err) => {
+                        release_operation_resources(&stmt, &timeout_guard);
+                        return Err(Error::from(err).into());
+                    }
+                };
+                let Some(row) = row else {
+                    release_operation_resources(&stmt, &timeout_guard);
+                    done = true;
+                    break;
+                };
+                let values = match read_row_values(&row, column_count) {
+                    Ok(values) => values,
+                    Err(err) => {
+                        release_operation_resources(&stmt, &timeout_guard);
+                        return Err(err);
+                    }
+                };
+                records.push(values);
+            }
+
+            Ok::<_, napi::Error>((records, done))
+        };
+        let column_names = self.column_names.clone();
+        let safe_ints = self.safe_ints;
+        let raw = self.raw;
+        let pluck = self.pluck;
+        env.execute_tokio_future(future, move |&mut env, (records, done)| {
+            let mut js_records = env.create_array(records.len() as u32)?;
+            for (index, values) in records.iter().enumerate() {
+                js_records.set(
+                    index as u32,
+                    map_values(&env, &column_names, values, safe_ints, raw, pluck)?,
+                )?;
+            }
+
+            let mut result = env.create_object()?;
+            result.set_named_property("records", js_records)?;
+            result.set_named_property("done", env.get_boolean(done)?)?;
+            Ok(result)
+        })
+    }
+
     #[napi]
     pub fn close(&self) {
         self.release_operation_resources();
     }
 
     fn release_operation_resources(&self) {
-        self.stmt.reset();
-        let mut timeout_guard = self.timeout_guard.lock().unwrap();
-        timeout_guard.take();
+        release_operation_resources(&self.stmt, &self.timeout_guard);
     }
+}
+
+fn release_operation_resources(
+    stmt: &libsql::Statement,
+    timeout_guard: &Mutex<Option<QueryTimeoutGuard>>,
+) {
+    stmt.reset();
+    let mut timeout_guard = timeout_guard.lock().unwrap();
+    timeout_guard.take();
 }
 
 /// Retrieve next row from an iterator synchronously. Needed for better-sqlite3 API compatibility.
@@ -1549,6 +1618,15 @@ fn runtime() -> Result<&'static Runtime> {
 
     let rt = RUNTIME.get_or_try_init(Runtime::new).unwrap();
     Ok(rt)
+}
+
+fn read_row_values(row: &libsql::Row, column_count: usize) -> Result<Vec<libsql::Value>> {
+    (0..column_count)
+        .map(|index| {
+            row.get_value(index as i32)
+                .map_err(|error| napi::Error::from_reason(error.to_string()))
+        })
+        .collect()
 }
 
 fn map_row(
@@ -1658,6 +1736,47 @@ fn map_row_raw(
         arr.set(idx as u32, js_value)?;
     }
     Ok(arr.coerce_to_object()?.into_unknown())
+}
+
+fn map_values(
+    env: &Env,
+    column_names: &[std::ffi::CString],
+    values: &[libsql::Value],
+    safe_ints: bool,
+    raw: bool,
+    pluck: bool,
+) -> Result<napi::JsUnknown> {
+    if pluck {
+        return values
+            .first()
+            .map(|value| convert_value_to_js(env, value, safe_ints))
+            .transpose()?
+            .map_or_else(|| Ok(env.get_null()?.into_unknown()), Ok);
+    }
+
+    if raw {
+        let mut result = env.create_array(values.len() as u32)?;
+        for (index, value) in values.iter().enumerate() {
+            result.set(index as u32, convert_value_to_js(env, value, safe_ints)?)?;
+        }
+        return Ok(result.coerce_to_object()?.into_unknown());
+    }
+
+    let result = env.create_object()?;
+    let result = unsafe { napi::JsObject::to_napi_value(env.raw(), result)? };
+    for (column_name, value) in column_names.iter().zip(values) {
+        let js_value = convert_value_to_js(env, value, safe_ints)?;
+        unsafe {
+            napi::sys::napi_set_named_property(
+                env.raw(),
+                result,
+                column_name.as_ptr(),
+                napi::JsUnknown::to_napi_value(env.raw(), js_value)?,
+            );
+        }
+    }
+    let result: napi::JsObject = unsafe { napi::JsObject::from_napi_value(env.raw(), result)? };
+    Ok(result.into_unknown())
 }
 
 static LOGGER_INIT: OnceCell<()> = OnceCell::new();
