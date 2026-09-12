@@ -1495,12 +1495,11 @@ impl RowsIterator {
     }
 
     /// Reads one batch of rows. The batch size must be an integer between 1 and 10,000.
-    #[napi(ts_return_type = "Promise<{ records: unknown[]; done: boolean }>")]
+    #[napi(ts_return_type = "Promise<unknown[]>")]
     pub fn next_batch(&self, env: Env, max_rows: f64) -> Result<napi::JsObject> {
         if !max_rows.is_finite()
             || max_rows.fract() != 0.0
-            || max_rows < 1.0
-            || max_rows > MAX_ROW_BATCH_SIZE as f64
+            || !(1.0..=MAX_ROW_BATCH_SIZE as f64).contains(&max_rows)
         {
             return Err(napi::Error::from_reason(format!(
                 "maxRows must be an integer between 1 and {MAX_ROW_BATCH_SIZE}"
@@ -1517,40 +1516,31 @@ impl RowsIterator {
             self.column_names.len()
         };
         let future = async move {
-            let mut rows = rows.lock().await;
-            let mut records = Vec::with_capacity(max_rows);
-            let mut done = false;
-
-            for _ in 0..max_rows {
-                let row = match rows.next().await {
-                    Ok(row) => row,
-                    Err(err) => {
-                        release_operation_resources(&stmt, &timeout_guard);
-                        return Err(Error::from(err).into());
-                    }
-                };
-                let Some(row) = row else {
-                    release_operation_resources(&stmt, &timeout_guard);
-                    done = true;
-                    break;
-                };
-                let values = match read_row_values(&row, value_count) {
-                    Ok(values) => values,
-                    Err(err) => {
-                        release_operation_resources(&stmt, &timeout_guard);
-                        return Err(err);
-                    }
-                };
-                records.push(values);
+            let result: libsql::Result<_> = async {
+                let mut rows = rows.lock().await;
+                let mut records = Vec::with_capacity(max_rows);
+                for _ in 0..max_rows {
+                    let Some(row) = rows.next().await? else {
+                        break;
+                    };
+                    records.push(read_row_values(&row, value_count)?);
+                }
+                Ok(records)
             }
-
-            Ok::<_, napi::Error>((records, done))
+            .await;
+            if result
+                .as_ref()
+                .map_or(true, |records| records.len() < max_rows)
+            {
+                release_operation_resources(&stmt, &timeout_guard);
+            }
+            result.map_err(|err| Error::from(err).into())
         };
         let column_names = self.column_names.clone();
         let safe_ints = self.safe_ints;
         let raw = self.raw;
         let pluck = self.pluck;
-        env.execute_tokio_future(future, move |&mut env, (records, done)| {
+        env.execute_tokio_future(future, move |&mut env, records| {
             let mut js_records = env.create_array(records.len() as u32)?;
             for (index, values) in records.iter().enumerate() {
                 js_records.set(
@@ -1558,11 +1548,7 @@ impl RowsIterator {
                     map_values(&env, &column_names, values, safe_ints, raw, pluck)?,
                 )?;
             }
-
-            let mut result = env.create_object()?;
-            result.set_named_property("records", js_records)?;
-            result.set_named_property("done", env.get_boolean(done)?)?;
-            Ok(result)
+            Ok(js_records)
         })
     }
 
@@ -1632,12 +1618,9 @@ fn runtime() -> Result<&'static Runtime> {
     Ok(rt)
 }
 
-fn read_row_values(row: &libsql::Row, column_count: usize) -> Result<Vec<libsql::Value>> {
+fn read_row_values(row: &libsql::Row, column_count: usize) -> libsql::Result<Vec<libsql::Value>> {
     (0..column_count)
-        .map(|index| {
-            row.get_value(index as i32)
-                .map_err(|error| napi::Error::from_reason(error.to_string()))
-        })
+        .map(|index| row.get_value(index as i32))
         .collect()
 }
 
