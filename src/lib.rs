@@ -205,6 +205,8 @@ pub struct Options {
     pub remoteEncryptionKey: Option<String>,
     // Default maximum time in milliseconds that a query is allowed to run.
     pub defaultQueryTimeout: Option<f64>,
+    // Default maximum number of rows to read per native iterator call.
+    pub defaultBatchSize: Option<f64>,
 }
 
 /// Per-query execution options.
@@ -240,6 +242,8 @@ pub struct Database {
     memory: bool,
     // Maximum time in milliseconds that a query is allowed to run.
     query_timeout: Option<Duration>,
+    // Default maximum number of rows to read per native iterator call.
+    default_batch_size: f64,
 }
 
 impl Drop for Database {
@@ -341,12 +345,17 @@ pub async fn connect(path: String, opts: Option<Options>) -> Result<Database> {
         .as_ref()
         .and_then(|o| o.defaultQueryTimeout)
         .and_then(query_timeout_duration);
+    let default_batch_size = opts
+        .as_ref()
+        .and_then(|o| o.defaultBatchSize)
+        .unwrap_or(1.0);
     Ok(Database {
         db: Some(db),
         conn: Some(conn),
         default_safe_integers,
         memory,
         query_timeout,
+        default_batch_size,
     })
 }
 
@@ -421,7 +430,13 @@ impl Database {
             pluck: false.into(),
             timing: false.into(),
         };
-        Ok(Statement::new(conn, stmt, mode, self.query_timeout))
+        Ok(Statement::new(
+            conn,
+            stmt,
+            mode,
+            self.query_timeout,
+            self.default_batch_size,
+        ))
     }
 
     /// Sets the authorizer for the database.
@@ -892,6 +907,8 @@ pub struct Statement {
     mode: AccessMode,
     // Maximum time in milliseconds that a query is allowed to run.
     query_timeout: Option<Duration>,
+    // Default maximum number of rows to read per native iterator call.
+    default_batch_size: f64,
 }
 
 #[napi]
@@ -908,6 +925,7 @@ impl Statement {
         stmt: libsql::Statement,
         mode: AccessMode,
         query_timeout: Option<Duration>,
+        default_batch_size: f64,
     ) -> Self {
         let column_names: Vec<std::ffi::CString> = stmt
             .columns()
@@ -921,7 +939,13 @@ impl Statement {
             column_names,
             mode,
             query_timeout,
+            default_batch_size,
         }
+    }
+
+    #[napi(getter)]
+    pub fn default_batch_size(&self) -> f64 {
+        self.default_batch_size
     }
 
     /// Executes a SQL statement.
