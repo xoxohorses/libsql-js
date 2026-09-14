@@ -1525,7 +1525,11 @@ impl RowsIterator {
                     let Some(row) = rows.next().await? else {
                         break;
                     };
-                    records.push(read_row_values(&row, value_count)?);
+                    records.push(
+                        (0..value_count)
+                            .map(|index| row.get_value(index as i32))
+                            .collect::<libsql::Result<Vec<_>>>()?,
+                    );
                 }
                 Ok(records)
             }
@@ -1613,12 +1617,6 @@ fn runtime() -> Result<&'static Runtime> {
 
     let rt = RUNTIME.get_or_try_init(Runtime::new).unwrap();
     Ok(rt)
-}
-
-fn read_row_values(row: &libsql::Row, column_count: usize) -> libsql::Result<Vec<libsql::Value>> {
-    (0..column_count)
-        .map(|index| row.get_value(index as i32))
-        .collect()
 }
 
 fn map_row(
