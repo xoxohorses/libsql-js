@@ -1534,7 +1534,9 @@ impl RowsIterator {
                 .as_ref()
                 .map_or(true, |records| records.len() < max_rows)
             {
-                release_operation_resources(&stmt, &timeout_guard);
+                stmt.reset();
+                let mut timeout_guard = timeout_guard.lock().unwrap();
+                timeout_guard.take();
             }
             result.map_err(|err| Error::from(err).into())
         };
@@ -1560,17 +1562,10 @@ impl RowsIterator {
     }
 
     fn release_operation_resources(&self) {
-        release_operation_resources(&self.stmt, &self.timeout_guard);
+        self.stmt.reset();
+        let mut timeout_guard = self.timeout_guard.lock().unwrap();
+        timeout_guard.take();
     }
-}
-
-fn release_operation_resources(
-    stmt: &libsql::Statement,
-    timeout_guard: &Mutex<Option<QueryTimeoutGuard>>,
-) {
-    stmt.reset();
-    let mut timeout_guard = timeout_guard.lock().unwrap();
-    timeout_guard.take();
 }
 
 /// Retrieve next row from an iterator synchronously. Needed for better-sqlite3 API compatibility.
