@@ -1474,6 +1474,8 @@ pub struct RowsIterator {
     raw: bool,
     pluck: bool,
     timeout_guard: Arc<Mutex<Option<QueryTimeoutGuard>>>,
+    // Set by close() so that an in-flight batch stops stepping the reset statement.
+    closed: Arc<AtomicBool>,
 }
 
 #[napi]
@@ -1495,6 +1497,7 @@ impl RowsIterator {
             raw,
             pluck,
             timeout_guard: Arc::new(Mutex::new(timeout_guard)),
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1536,6 +1539,7 @@ impl RowsIterator {
         let rows = self.rows.clone();
         let stmt = self.stmt.clone();
         let timeout_guard = self.timeout_guard.clone();
+        let closed = self.closed.clone();
         let value_count = if self.pluck {
             self.column_names.len().min(1)
         } else {
@@ -1546,6 +1550,10 @@ impl RowsIterator {
                 let mut rows = rows.lock().await;
                 let mut records = Vec::with_capacity(max_rows);
                 for _ in 0..max_rows {
+                    // Stepping after close() would restart the query from the first row.
+                    if closed.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let Some(row) = rows.next().await? else {
                         break;
                     };
@@ -1558,9 +1566,10 @@ impl RowsIterator {
                 Ok(records)
             }
             .await;
-            if result
-                .as_ref()
-                .map_or(true, |records| records.len() < max_rows)
+            if closed.load(Ordering::SeqCst)
+                || result
+                    .as_ref()
+                    .map_or(true, |records| records.len() < max_rows)
             {
                 stmt.reset();
                 let mut timeout_guard = timeout_guard.lock().unwrap();
@@ -1586,6 +1595,7 @@ impl RowsIterator {
 
     #[napi]
     pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         self.release_operation_resources();
     }
 
